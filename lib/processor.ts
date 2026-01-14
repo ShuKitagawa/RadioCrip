@@ -8,6 +8,11 @@ import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 // @ts-ignore
 import { path as ffprobePath } from "ffprobe-static";
+import OpenAI from "openai";
+
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+});
 
 // Set ffmpeg and ffprobe paths
 if (ffmpegPath) {
@@ -144,8 +149,28 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
                 .run();
         });
 
-        // 4. Render Video (Skipping transcription)
-        update("processing", 60, "Rendering Video...");
+        // 4. Transcription (NEW)
+        update("processing", 50, "Transcribing Audio...");
+        let srtPath = null;
+        try {
+            console.log(`Job ${jobId}: Sending to Whisper...`);
+            const transcript = await transcribeAudio(clipPath);
+            console.log(`Job ${jobId}: Whisper received ${transcript.segments?.length || 0} segments`);
+
+            const srtContent = generateSRT(transcript.segments || []);
+            if (srtContent.trim()) {
+                srtPath = path.join(jobDir, "subs.srt");
+                fs.writeFileSync(srtPath, srtContent);
+                console.log(`Job ${jobId}: SRT file created at ${srtPath}`);
+            } else {
+                console.warn(`Job ${jobId}: Transcription result empty, skipping subtitles.`);
+            }
+        } catch (err) {
+            console.error(`Job ${jobId}: Transcription failed:`, err);
+        }
+
+        // 5. Render Video (Updated with subtitles)
+        update("processing", 70, "Rendering Video...");
 
         // Sanitize title for filename
         const safeTitle = (targetEp.title || "episode")
@@ -160,7 +185,7 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
         const fileName = `${safeTitle}_切り抜き_${startStr}~${endStr}.mp4`;
         const outputPath = path.join(DOWNLOAD_DIR, fileName);
 
-        await renderVideo(clipPath, coverPath, outputPath);
+        await renderVideo(clipPath, coverPath, outputPath, srtPath);
 
         // Cleanup
         // fs.rmSync(jobDir, { recursive: true, force: true }); // Keep for debug if needed, or delete
@@ -293,16 +318,14 @@ async function analyzeVolume(filePath: string, start: number, duration: number):
     });
 }
 
-async function renderVideo(audioPath: string, coverPath: string | null, outputPath: string) {
+async function renderVideo(audioPath: string, coverPath: string | null, outputPath: string, srtPath: string | null = null) {
     return new Promise<void>((resolve, reject) => {
         let command = ffmpeg();
 
         // Inputs
-        // 1. Background (Color or Image)
         if (coverPath) {
-            command.input(coverPath).loop(60); // Loop image
+            command.input(coverPath).loop(60);
         } else {
-            // Solid color
             command.input("color=c=slate:s=1080x1920").inputOption("-f lavfi");
         }
 
@@ -315,17 +338,35 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
             filters.push('[0:v]scale=900:-1[fg]');
             filters.push('[bg][fg]overlay=(W-w)/2:(H-h)/2[base]');
         } else {
-            filters.push('[0:v]null[base]'); // Pass through if color source
+            filters.push('[0:v]null[base]');
+        }
+
+        // Subtitles Filter (Styled)
+        if (srtPath && fs.existsSync(srtPath)) {
+            // FFmpeg subtitles filter on Windows requires very specific escaping:
+            // 1. Double backslashes for path
+            // 2. Colon after drive letter needs escaping
+            // 3. The whole path wrapped in single quotes
+            const escapedPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+
+            // Fontname must match exactly what is on the system. 
+            // Often "Noto Sans JP" works but let's ensure styling is robust.
+            const style = "Fontname=Noto Sans JP,Fontsize=18,PrimaryColour=&H000000,OutlineColour=&HFFFFFF,Outline=1,BorderStyle=1,Alignment=2,MarginV=30";
+
+            filters.push(`[base]subtitles='${escapedPath}':force_style='${style}'[final]`);
+        } else {
+            console.warn("No subtitles file found or generated, skipping subtitles filter.");
+            filters.push('[base]null[final]');
         }
 
         command
-            .complexFilter(filters, 'base') // Output directly to base which is now the final output for video stream
+            .complexFilter(filters, 'final')
             .outputOptions([
                 '-map 1:a',
                 '-c:a aac',
                 '-c:v libx264',
                 '-pix_fmt yuv420p',
-                '-shortest', // Stop when shortest input (audio) ends
+                '-shortest',
                 '-r 30'
             ])
             .output(outputPath)
@@ -338,8 +379,34 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
     });
 }
 
+async function transcribeAudio(filePath: string) {
+    return await openai.audio.transcriptions.create({
+        file: fs.createReadStream(filePath),
+        model: "whisper-1",
+        response_format: "verbose_json",
+        language: "ja",
+    });
+}
+
+function generateSRT(segments: any[]): string {
+    return segments.map((seg, i) => {
+        const start = formatSRTTime(seg.start);
+        const end = formatSRTTime(seg.end);
+        return `${i + 1}\n${start} --> ${end}\n${seg.text.trim()}\n`;
+    }).join("\n");
+}
+
+function formatSRTTime(seconds: number): string {
+    const hh = Math.floor(seconds / 3600).toString().padStart(2, '0');
+    const mm = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+    const ss = Math.floor(seconds % 60).toString().padStart(2, '0');
+    const ms = Math.floor((seconds % 1) * 1000).toString().padStart(3, '0');
+    return `${hh}:${mm}:${ss},${ms}`;
+}
+
 /**
  * Searches for silence around a timestamp to find a natural break.
+
  * @param filePath Path to audio file
  * @param pivotTime The time around which to search
  * @param windowSeconds How many seconds to search
