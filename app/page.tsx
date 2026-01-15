@@ -30,6 +30,7 @@ export default function Home() {
   const [downloadUrl, setDownloadUrl] = useState("");
   const [error, setError] = useState("");
   const [processingJobId, setProcessingJobId] = useState<string | null>(null);
+  const [enableSubtitles, setEnableSubtitles] = useState(true);
 
 
   const pollInterval = useRef<NodeJS.Timeout | null>(null);
@@ -60,7 +61,7 @@ export default function Home() {
       const res = await fetch("/api/process", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rssUrl, episodeUrl }),
+        body: JSON.stringify({ rssUrl, episodeUrl, enableSubtitles }),
       });
 
       if (!res.ok) {
@@ -132,6 +133,22 @@ export default function Home() {
 
         {/* Content */}
         <div className="p-6 space-y-6">
+          {/* Subtitle Toggle */}
+          <div className="flex items-center justify-between p-4 bg-slate-800/30 rounded-xl border border-slate-700/50">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-200">字幕生成 (OpenAI)</h3>
+              <p className="text-xs text-slate-500">Whisperを使用して字幕を自動生成します</p>
+            </div>
+            <button
+              onClick={() => setEnableSubtitles(!enableSubtitles)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${enableSubtitles ? 'bg-indigo-600' : 'bg-slate-700'}`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${enableSubtitles ? 'translate-x-6' : 'translate-x-1'}`}
+              />
+            </button>
+          </div>
+
           {/* Status Display (Global) */}
           {status === "processing" && (
             <div className="space-y-3 bg-slate-900/50 p-4 rounded-xl border border-indigo-500/30 sticky top-0 z-10 backdrop-blur-sm">

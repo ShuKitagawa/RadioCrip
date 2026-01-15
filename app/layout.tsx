@@ -6,7 +6,7 @@ const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
   title: "車すきすきすきラジオ切り抜きくん",
-  description: "車すきすきすきラジオの最新エピソードから縦動画を生成します。",
+  description: "車すきすきすきラジオのエピソードから縦動画を生成します。",
 };
 
 export default function RootLayout({
@@ -15,9 +15,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="ja">
       <body className={inter.className}>
-        {children}
+        <div className="min-h-screen bg-slate-950">
+          {children}
+        </div>
       </body>
     </html>
   );

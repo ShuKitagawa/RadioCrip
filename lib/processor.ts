@@ -8,11 +8,10 @@ import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 // @ts-ignore
 import { path as ffprobePath } from "ffprobe-static";
-import OpenAI from "openai";
+// @ts-ignore
+import * as whisper from "@kutalia/whisper-node-addon";
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-});
+// OpenAI client and polyfills removed for local Whisper migration
 
 // Set ffmpeg and ffprobe paths
 if (ffmpegPath) {
@@ -57,7 +56,7 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
-export async function startJob(jobId: string, rssUrl: string, episodeUrl?: string) {
+export async function startJob(jobId: string, rssUrl: string, episodeUrl?: string, enableSubtitles: boolean = true) {
     const jobDir = path.join(os.tmpdir(), `podclip-${jobId}`);
     if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
 
@@ -152,37 +151,65 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
         // 4. Transcription (NEW)
         update("processing", 50, "Transcribing Audio...");
         let srtPath = null;
-        try {
-            console.log(`Job ${jobId}: Sending to Whisper...`);
-            const transcript = await transcribeAudio(clipPath);
-            console.log(`Job ${jobId}: Whisper received ${transcript.segments?.length || 0} segments`);
 
-            const srtContent = generateSRT(transcript.segments || []);
-            if (srtContent.trim()) {
-                srtPath = path.join(jobDir, "subs.srt");
-                fs.writeFileSync(srtPath, srtContent);
-                console.log(`Job ${jobId}: SRT file created at ${srtPath}`);
-            } else {
-                console.warn(`Job ${jobId}: Transcription result empty, skipping subtitles.`);
+        if (enableSubtitles) {
+            try {
+                console.log(`Job ${jobId}: Preparing local transcription...`);
+
+                // 4a. Convert to 16kHz Mono WAV (Required for Whisper)
+                const wavPath = path.join(jobDir, "clip.wav");
+                update("processing", 55, "Generating WAV for Whisper...");
+                await convertToWav(clipPath, wavPath);
+
+                // 4b. Ensure model exists
+                const modelName = "ggml-medium.bin";
+                const modelPath = path.join(process.cwd(), "models", modelName);
+                if (!fs.existsSync(modelPath)) {
+                    update("processing", 60, "Downloading Whisper Model (150MB)...");
+                    await downloadWhisperModel(modelName, modelPath);
+                }
+
+                // 4c. Transcribe Locally
+                update("processing", 65, "Transcribing Locally...");
+                console.log(`Job ${jobId}: Starting local transcription with model: ${modelPath}`);
+                const result = await whisper.transcribe({
+                    fname_inp: wavPath,
+                    model: modelPath,
+                    language: "ja",
+                    use_gpu: true,
+                    translate: false // Ensure we get Japanese, not English translation
+                });
+
+                console.log(`Job ${jobId}: Raw transcription result:`, JSON.stringify(result).substring(0, 1000));
+
+                const rawSegments = result.transcription || [];
+                console.log(`Job ${jobId}: Extracted ${rawSegments.length} segments.`);
+
+                const srtContent = generateSRT(rawSegments);
+                console.log(`Job ${jobId}: Generated SRT length: ${srtContent.length} chars`);
+                if (srtContent.trim()) {
+                    srtPath = path.join(jobDir, "subs.srt");
+                    fs.writeFileSync(srtPath, srtContent, 'utf8');
+                    console.log(`Job ${jobId}: SRT file created at ${srtPath}`);
+                } else {
+                    console.warn(`Job ${jobId}: Transcription result empty, skipping subtitles.`);
+                }
+            } catch (err) {
+                console.error(`Job ${jobId}: Local transcription failed:`, err);
             }
-        } catch (err) {
-            console.error(`Job ${jobId}: Transcription failed:`, err);
+        } else {
+            console.log(`Job ${jobId}: Subtitles disabled, skipping transcription.`);
         }
 
         // 5. Render Video (Updated with subtitles)
         update("processing", 70, "Rendering Video...");
 
-        // Sanitize title for filename
+        // Safe sanitized title: Allow alphanumeric and CJK, replace everything else with underscore
         const safeTitle = (targetEp.title || "episode")
-            .replace(/[\\/:*?"<>|]/g, "")
-            .replace(/\s+/g, " ")
-            .trim()
+            .replace(/[^\w\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf]/g, "_")
             .substring(0, 50);
 
-        // Dynamic timestamps
-        const startStr = formatTimeForFilename(finalStartTime);
-        const endStr = formatTimeForFilename(finalEndTime);
-        const fileName = `${safeTitle}_切り抜き_${startStr}~${endStr}.mp4`;
+        const fileName = `${safeTitle}_${jobId.substring(0, 8)}.mp4`;
         const outputPath = path.join(DOWNLOAD_DIR, fileName);
 
         await renderVideo(clipPath, coverPath, outputPath, srtPath);
@@ -344,24 +371,33 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
         // Subtitles Filter (Styled)
         if (srtPath && fs.existsSync(srtPath)) {
             // FFmpeg subtitles filter on Windows requires very specific escaping:
-            // 1. Double backslashes for path
-            // 2. Colon after drive letter needs escaping
-            // 3. The whole path wrapped in single quotes
+            // 1. Double backslashes for path or forward slashes
+            // 2. Colon after drive letter needs escaping (C\:/...)
+            // 3. The path must be single-quoted
             const escapedPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 
-            // Fontname must match exactly what is on the system. 
-            // Often "Noto Sans JP" works but let's ensure styling is robust.
-            const style = "Fontname=Noto Sans JP,Fontsize=18,PrimaryColour=&H000000,OutlineColour=&HFFFFFF,Outline=1,BorderStyle=1,Alignment=2,MarginV=30";
+            // INCREASED: Fontsize=36, MarginV=100 for better visibility in 1080x1920
+            // BorderStyle=1 is outline
+            // Explicit color format &H<alpha><blue><green><red>
+            // Fontsize increased to 52.
+            // Note: Line spacing is difficult to control with force_style, 
+            // but increasing font size naturally improves presence.
+            const style = "PlayResX=1080,PlayResY=1920,Fontname=MS Gothic,Fontsize=52,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,BorderStyle=1,Alignment=2,MarginV=150,MarginL=150,MarginR=150";
 
-            filters.push(`[base]subtitles='${escapedPath}':force_style='${style}'[final]`);
+            console.log(`Job: Applying subtitles with escaped path: ${escapedPath}`);
+            filters.push(`[base]subtitles=filename='${escapedPath}':force_style='${style}'[final]`);
         } else {
-            console.warn("No subtitles file found or generated, skipping subtitles filter.");
+            console.warn("No subtitles file found or srtPath is null, skipping subtitles filter.");
             filters.push('[base]null[final]');
         }
 
         command
-            .complexFilter(filters, 'final')
+            .complexFilter(filters) // No second argument to avoid automatic mapping
+            .on('start', (commandLine) => {
+                console.log('Spawned Ffmpeg with command: ' + commandLine);
+            })
             .outputOptions([
+                '-map [final]', // Manually map the result of our complex filter
                 '-map 1:a',
                 '-c:a aac',
                 '-c:v libx264',
@@ -379,21 +415,68 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
     });
 }
 
-async function transcribeAudio(filePath: string) {
-    return await openai.audio.transcriptions.create({
-        file: fs.createReadStream(filePath),
-        model: "whisper-1",
-        response_format: "verbose_json",
-        language: "ja",
+async function convertToWav(inputPath: string, outputPath: string) {
+    return new Promise<void>((resolve, reject) => {
+        ffmpeg(inputPath)
+            .outputOptions([
+                '-ar 16000',
+                '-ac 1',
+                '-c:a pcm_s16le'
+            ])
+            .output(outputPath)
+            .on('end', () => resolve())
+            .on('error', (err) => reject(err))
+            .run();
     });
 }
 
+async function downloadWhisperModel(modelName: string, dest: string) {
+    const modelsDir = path.dirname(dest);
+    if (!fs.existsSync(modelsDir)) {
+        fs.mkdirSync(modelsDir, { recursive: true });
+    }
+
+    const url = `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${modelName}`;
+    console.log(`Downloading Whisper model from ${url}...`);
+    return await downloadFile(url, dest);
+}
+
 function generateSRT(segments: any[]): string {
-    return segments.map((seg, i) => {
-        const start = formatSRTTime(seg.start);
-        const end = formatSRTTime(seg.end);
-        return `${i + 1}\n${start} --> ${end}\n${seg.text.trim()}\n`;
-    }).join("\n");
+    // kutalia addon returns an array of segments: [["00:00:00.000", "00:00:05.180", "Text..."], ...]
+
+    let blockIndex = 1;
+    let srt = "";
+
+    const maxCharsPerLine = 14; // Slightly reduced for larger 52px font
+
+    for (const seg of segments) {
+        if (Array.isArray(seg) && seg.length >= 3) {
+            const start = seg[0].replace('.', ',');
+            const end = seg[1].replace('.', ',');
+            let text = seg[2].trim();
+
+            if (text) {
+                // Smart splitting for Japanese:
+                // 1. Try splitting at punctuation (。, 、)
+                // 2. If a segment is still too long, split every N characters
+                text = text.replace(/([、。])/g, "$1\n").trim();
+
+                const lines = text.split("\n");
+                const processedLines = lines.flatMap((line: string) => {
+                    const chunks = [];
+                    for (let i = 0; i < line.length; i += maxCharsPerLine) {
+                        chunks.push(line.slice(i, i + maxCharsPerLine));
+                    }
+                    return chunks;
+                });
+
+                srt += `${blockIndex}\n${start} --> ${end}\n${processedLines.join("\n")}\n\n`;
+                blockIndex++;
+            }
+        }
+    }
+
+    return srt;
 }
 
 function formatSRTTime(seconds: number): string {
