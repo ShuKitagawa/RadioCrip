@@ -23,6 +23,9 @@ yarn-error.log*
 # Local env files
 .env*.local
 
+# Models
+models/
+
 # Downloads
 public/downloads/*
 !public/downloads/.gitkeep
