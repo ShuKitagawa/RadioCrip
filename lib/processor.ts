@@ -11,6 +11,9 @@ import { path as ffprobePath } from "ffprobe-static";
 // @ts-ignore
 import * as whisper from "@kutalia/whisper-node-addon";
 import AdmZip from "adm-zip";
+import { loadDefaultJapaneseParser } from "budoux";
+
+const bp = loadDefaultJapaneseParser();
 
 // OpenAI client and polyfills removed for local Whisper migration
 
@@ -207,8 +210,8 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
             console.log(`Job ${jobId}: Subtitles disabled, skipping transcription.`);
         }
 
-        // 5. Render Video (Updated with subtitles)
-        update("processing", 70, "Rendering Video...");
+        // 5. Render Video (Subtitled only for initial preview)
+        update("processing", 70, "Rendering Video Preview...");
 
         const safeTitle = (targetEp.title || "episode")
             .replace(/[^\w\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf]/g, "_")
@@ -222,57 +225,32 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
 
         const timeStr = `${formatSec(finalStartTime)}～${formatSec(finalStartTime + finalDuration)}`;
 
-        let finalFileName = "";
-        let finalDownloadUrl = "";
+        // Paths for dual output
+        const burnedFileName = `【切り抜き1分】${safeTitle}_${timeStr}.mp4`;
+        const burnedOutputPath = path.join(DOWNLOAD_DIR, burnedFileName);
 
-        if (exportMode === 'premiere') {
-            // mode 1: Premiere Export (Clean Video + SRT + XML ZIP)
-            const cleanVideoName = `【切り抜き1分】${safeTitle}_${timeStr}_CLEAN.mp4`;
-            const cleanVideoPath = path.join(jobDir, cleanVideoName);
+        // Initial render: Standard MP4 with subtitles
+        await renderVideo(clipPath, coverPath, burnedOutputPath, srtPath, targetEp.title, true);
 
-            // Render video without BURNED subtitles
-            update("processing", 75, "Rendering Clean Video for Premiere...");
-            await renderVideo(clipPath, coverPath, cleanVideoPath, null, targetEp.title);
-
-            // Generate FCP XML
-            const xmlName = "project.xml";
-            const xmlPath = path.join(jobDir, xmlName);
-            const xmlContent = generateFCPXML(cleanVideoName, finalDuration, targetEp.title || "Clip");
-            fs.writeFileSync(xmlPath, xmlContent, 'utf8');
-
-            // Package into ZIP
-            update("processing", 90, "Packaging for Premiere...");
-            const zip = new AdmZip();
-            zip.addLocalFile(cleanVideoPath);
-            if (srtPath && fs.existsSync(srtPath)) zip.addLocalFile(srtPath);
-            zip.addLocalFile(xmlPath);
-
-            const zipName = `【切り抜き1分】${safeTitle}_${timeStr}_Premiere.zip`;
-            const zipPath = path.join(DOWNLOAD_DIR, zipName);
-            zip.writeZip(zipPath);
-
-            finalFileName = zipName;
-            finalDownloadUrl = `/downloads/${encodeURIComponent(zipName)}`;
-        } else {
-            // mode 2: Normal Video (Burned subtitles)
-            const fileName = `【切り抜き1分】${safeTitle}_${timeStr}.mp4`;
-            const outputPath = path.join(DOWNLOAD_DIR, fileName);
-            await renderVideo(clipPath, coverPath, outputPath, srtPath, targetEp.title);
-
-            finalFileName = fileName;
-            finalDownloadUrl = `/downloads/${encodeURIComponent(fileName)}`;
-        }
-
-        // Cleanup
-        // fs.rmSync(jobDir, { recursive: true, force: true }); 
-
-        // Complete
+        // Complete Stage 1
         const j = jobs.get(jobId);
         if (j) {
             j.status = "completed";
             j.progress = 100;
             j.message = "Done!";
-            j.downloadUrl = finalDownloadUrl;
+            j.downloadUrl = `/downloads/${encodeURIComponent(burnedFileName)}`;
+            j.premiereStatus = "none";
+            j.filePath = burnedOutputPath;
+
+            // Save metadata for on-demand Premiere export
+            const metadata = {
+                clipPath, coverPath, srtPath,
+                title: targetEp.title,
+                safeTitle, timeStr,
+                duration: finalDuration,
+                jobDir
+            };
+            fs.writeFileSync(path.join(jobDir, 'premiere_metadata.json'), JSON.stringify(metadata), 'utf8');
         }
 
     } catch (err: any) {
@@ -394,7 +372,14 @@ async function analyzeVolume(filePath: string, start: number, duration: number):
     });
 }
 
-async function renderVideo(audioPath: string, coverPath: string | null, outputPath: string, srtPath: string | null = null, title: string | null = null) {
+async function renderVideo(
+    audioPath: string,
+    coverPath: string | null,
+    outputPath: string,
+    srtPath: string | null = null,
+    title: string | null = null,
+    burned: boolean = true
+) {
     return new Promise<void>((resolve, reject) => {
         let command = ffmpeg();
 
@@ -406,8 +391,7 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
         }
 
         command.input(audioPath);
-        // Audio Fade-out: 2s fade at the end (st=58 for 60s clip)
-        command.audioFilters('afade=t=out:st=58:d=2');
+        command.audioFilters('afade=t=out:st=55:d=3');
 
         const filters = [];
 
@@ -421,58 +405,56 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
 
         // Title Overlay (Top)
         if (title) {
-            // Processing title for line breaks:
-            // 1. Break after "】"
-            // 2. Break every 15 characters if line is too long
             let processedTitle = title.replace(/】/g, "】\n").trim();
             const titleLines = processedTitle.split("\n");
             const finalTitleLines = titleLines.flatMap(line => {
                 const chunks = [];
-                for (let i = 0; i < line.length; i += 15) {
-                    chunks.push(line.slice(i, i + 15));
+                for (let i = 0; i < line.length; i += 12) {
+                    chunks.push(line.slice(i, i + 12));
                 }
                 return chunks;
             });
             const displayTitle = finalTitleLines.join("\n");
-
-            // FFmpeg drawtext requires escaped colons and single quotes
-            const escapedTitle = displayTitle
-                .replace(/:/g, '\\:')
-                .replace(/'/g, "'\\\\''");
-
-            // drawtext filter for title
-            // x=(w-text_w)/2:y=150 (Top Center)
-            // text_align=center ensures individual lines are centered
-            // Font: hgrgm.ttc (HG Maru Gothic M-PRO) is a common "cute" rounded font on Windows.
-            // Using fontsize=80 for higher impact.
-            filters.push(`[base_pre]drawtext=text='${escapedTitle}':fontfile='C\\\\:/Windows/Fonts/hgrgm.ttc':fontsize=80:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=150:line_spacing=15:text_align=center[title]`);
+            const escapedTitle = displayTitle.replace(/:/g, '\\:').replace(/'/g, "'\\\\''");
+            const fontPath = path.resolve(process.cwd(), 'fonts', 'ZenMaruGothic-Bold.ttf').replace(/\\/g, '/').replace(/:/g, '\\:');
+            filters.push(`[base_pre]drawtext=text='${escapedTitle}':fontfile='${fontPath}':fontsize=80:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=150:line_spacing=15:text_align=center[title]`);
         } else {
             filters.push('[base_pre]null[title]');
         }
 
-        // Subtitles Filter (Styled)
-        let subInput = 'title';
-        if (srtPath && fs.existsSync(srtPath)) {
+        // Subtitles Filter (Conditional)
+        let videoInput = 'title';
+        if (burned && srtPath && fs.existsSync(srtPath)) {
             const escapedPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
             const style = "PlayResX=1080,PlayResY=1920,Fontname=MS Gothic,Fontsize=60,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,BorderStyle=1,Alignment=2,MarginV=180,MarginL=150,MarginR=150";
-
-            console.log(`Job: Applying subtitles with escaped path: ${escapedPath}`);
-            filters.push(`[title]subtitles=filename='${escapedPath}':force_style='${style}'[subs]`);
-            subInput = 'subs';
-        } else {
-            console.warn("No subtitles file found or srtPath is null, skipping subtitles filter.");
+            filters.push(`[${videoInput}]subtitles=filename='${escapedPath}':force_style='${style}'[subs]`);
+            videoInput = 'subs';
         }
 
-        // Final Fade-out Filter (2s)
-        filters.push(`[${subInput}]fade=t=out:st=58:d=2[final]`);
+        // Final Fade-out to black (53s to 55s - 2 second fade)
+        filters.push(`[${videoInput}]fade=t=out:st=53:d=2[blacked]`);
+
+        // End Card Text (55s to 60s) - Multiple lines stacked
+        const fontPath = path.resolve(process.cwd(), 'fonts', 'ZenMaruGothic-Bold.ttf').replace(/\\/g, '/').replace(/:/g, '\\:');
+
+        // Line 1: "続きは"
+        filters.push(`[blacked]drawtext=text='続きは':fontfile='${fontPath}':fontsize=70:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-120:enable='between(t,55,60)'[line1]`);
+        // Line 2: "Spotifyで"
+        filters.push(`[line1]drawtext=text='Spotifyで':fontfile='${fontPath}':fontsize=70:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-40:enable='between(t,55,60)'[line2]`);
+        // Line 3: "「車すきすきすきすきラジオ」"
+        const line3Text = '「車すきすきすきすきラジオ」'.replace(/'/g, "'\\\\''");
+        filters.push(`[line2]drawtext=text='${line3Text}':fontfile='${fontPath}':fontsize=70:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2+40:enable='between(t,55,60)'[line3]`);
+        // Line 4: "で検索！"
+        filters.push(`[line3]drawtext=text='で検索！':fontfile='${fontPath}':fontsize=70:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2+120:enable='between(t,55,60)'[final]`);
 
         command
-            .complexFilter(filters) // No second argument to avoid automatic mapping
+            .complexFilter(filters)
             .on('start', (commandLine) => {
-                console.log('Spawned Ffmpeg with command: ' + commandLine);
+                console.log('Spawned Ffmpeg command: ' + commandLine);
             })
+            .output(outputPath)
             .outputOptions([
-                '-map [final]', // Manually map the result of our complex filter
+                '-map [final]',
                 '-map 1:a',
                 '-c:a aac',
                 '-c:v libx264',
@@ -480,7 +462,6 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
                 '-shortest',
                 '-r 30'
             ])
-            .output(outputPath)
             .on("end", () => resolve())
             .on("error", (err) => {
                 console.error("FFmpeg error:", err);
@@ -536,19 +517,33 @@ function generateSRT(segments: any[]): string {
                     .replace(/笑い声/g, "ww")
                     .replace(/笑う/g, "ww");
 
-                // Smart splitting for Japanese:
-                // 1. Try splitting at punctuation (。, 、)
-                // 2. If a segment is still too long, split every N characters
-                text = text.replace(/([、。])/g, "$1\n").trim();
+                const chunks = bp.parse(text);
+                const processedLines = [];
+                let currentLine = "";
 
-                const lines = text.split("\n");
-                const processedLines = lines.flatMap((line: string) => {
-                    const chunks = [];
-                    for (let i = 0; i < line.length; i += maxCharsPerLine) {
-                        chunks.push(line.slice(i, i + maxCharsPerLine));
+                for (const chunk of chunks) {
+                    if ((currentLine + chunk).length > maxCharsPerLine) {
+                        if (currentLine) {
+                            processedLines.push(currentLine);
+                            currentLine = "";
+                        }
+
+                        // If the chunk itself is longer than the limit, split it
+                        if (chunk.length > maxCharsPerLine) {
+                            let remaining = chunk;
+                            while (remaining.length > maxCharsPerLine) {
+                                processedLines.push(remaining.slice(0, maxCharsPerLine));
+                                remaining = remaining.slice(maxCharsPerLine);
+                            }
+                            currentLine = remaining;
+                        } else {
+                            currentLine = chunk;
+                        }
+                    } else {
+                        currentLine += chunk;
                     }
-                    return chunks;
-                });
+                }
+                if (currentLine) processedLines.push(currentLine);
 
                 srt += `${blockIndex}\n${start} --> ${end}\n${processedLines.join("\n")}\n\n`;
                 blockIndex++;
@@ -691,4 +686,57 @@ function generateFCPXML(videoFile: string, duration: number, title: string) {
     </media>
 </sequence>
 </xmeml>`;
+}
+export async function startPremiereExport(jobId: string) {
+    const job = jobs.get(jobId);
+    if (!job) throw new Error("Job not found");
+
+    job.premiereStatus = "processing";
+    job.premiereProgress = 0;
+
+    // Construct the job directory path using jobId (must match startJob naming)
+    const jobDir = path.join(os.tmpdir(), `podclip-${jobId}`);
+    const metadataPath = path.join(jobDir, 'premiere_metadata.json');
+
+    if (!fs.existsSync(metadataPath)) {
+        job.premiereStatus = "failed";
+        throw new Error("Premiere metadata not found. Please re-run the job.");
+    }
+
+    const m = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+
+    try {
+        const cleanFileName = `【切り抜き1分】${m.safeTitle}_${m.timeStr}_CLEAN.mp4`;
+        const cleanOutputPath = path.join(m.jobDir, cleanFileName);
+
+        // Render clean video (no burned subtitles)
+        job.premiereProgress = 20;
+        await renderVideo(m.clipPath, m.coverPath, cleanOutputPath, null, m.title, false);
+
+        // XML
+        job.premiereProgress = 80;
+        const xmlName = "project.xml";
+        const xmlPath = path.join(m.jobDir, xmlName);
+        const xmlContent = generateFCPXML(cleanFileName, m.duration, m.title || "Clip");
+        fs.writeFileSync(xmlPath, xmlContent, 'utf8');
+
+        // Package
+        job.premiereProgress = 90;
+        const zip = new AdmZip();
+        zip.addLocalFile(cleanOutputPath);
+        if (m.srtPath && fs.existsSync(m.srtPath)) zip.addLocalFile(m.srtPath);
+        zip.addLocalFile(xmlPath);
+
+        const zipName = `【切り抜き1分】${m.safeTitle}_${m.timeStr}_Premiere.zip`;
+        const zipPath = path.join(DOWNLOAD_DIR, zipName);
+        zip.writeZip(zipPath);
+
+        job.downloadUrlZip = `/downloads/${encodeURIComponent(zipName)}`;
+        job.premiereStatus = "completed";
+        job.premiereProgress = 100;
+
+    } catch (err: any) {
+        console.error("Premiere Export Failed:", err);
+        job.premiereStatus = "failed";
+    }
 }

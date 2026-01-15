@@ -22,6 +22,9 @@ export async function GET(req: Request) {
         progress: job.progress,
         message: job.message,
         downloadUrl: job.downloadUrl,
+        downloadUrlZip: job.downloadUrlZip,
+        premiereStatus: job.premiereStatus,
+        premiereProgress: job.premiereProgress,
         error: job.error
     });
 }

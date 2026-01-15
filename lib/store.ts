@@ -9,6 +9,9 @@ export interface Job {
     message: string;
     startTime: number;
     downloadUrl?: string; // Relative URL to public file
+    downloadUrlZip?: string; // Relative URL to Premiere ZIP
+    premiereStatus?: "none" | "processing" | "completed" | "failed";
+    premiereProgress?: number;
     filePath?: string;    // Absolute path to result on disk
     error?: string;
 }

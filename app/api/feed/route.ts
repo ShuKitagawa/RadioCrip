@@ -24,7 +24,10 @@ export async function GET(req: Request) {
             guid: item.guid,
         })).filter(ep => ep.audioUrl); // Only with audio
 
-        return NextResponse.json({ episodes });
+        return NextResponse.json({
+            episodes,
+            coverUrl: feed.image?.url
+        });
     } catch (error) {
         console.error("Feed Error:", error);
         return NextResponse.json({ error: "Failed to parse RSS feed" }, { status: 500 });
