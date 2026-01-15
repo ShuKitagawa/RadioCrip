@@ -178,6 +178,7 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
                     language: "ja",
                     use_gpu: true,
                     translate: false,
+                    max_len: 35, // Increased from 20 for longer, more readable segments
                     progress_callback: (progress: number) => {
                         const percent = Math.round(progress);
                         update("processing", 65 + (percent * 0.25), `Transcribing Locally (${percent}%)...`);
@@ -208,15 +209,21 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
         // 5. Render Video (Updated with subtitles)
         update("processing", 70, "Rendering Video...");
 
-        // Safe sanitized title: Allow alphanumeric and CJK, replace everything else with underscore
         const safeTitle = (targetEp.title || "episode")
             .replace(/[^\w\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf]/g, "_")
             .substring(0, 50);
 
-        const fileName = `${safeTitle}_${jobId.substring(0, 8)}.mp4`;
+        const formatSec = (s: number) => {
+            const min = Math.floor(s / 60);
+            const sec = Math.floor(s % 60);
+            return `${min.toString().padStart(2, '0')}分${sec.toString().padStart(2, '0')}秒`;
+        };
+
+        const timeStr = `${formatSec(finalStartTime)}～${formatSec(finalStartTime + finalDuration)}`;
+        const fileName = `【切り抜き1分】${safeTitle}_${timeStr}.mp4`;
         const outputPath = path.join(DOWNLOAD_DIR, fileName);
 
-        await renderVideo(clipPath, coverPath, outputPath, srtPath);
+        await renderVideo(clipPath, coverPath, outputPath, srtPath, targetEp.title);
 
         // Cleanup
         // fs.rmSync(jobDir, { recursive: true, force: true }); // Keep for debug if needed, or delete
@@ -349,7 +356,7 @@ async function analyzeVolume(filePath: string, start: number, duration: number):
     });
 }
 
-async function renderVideo(audioPath: string, coverPath: string | null, outputPath: string, srtPath: string | null = null) {
+async function renderVideo(audioPath: string, coverPath: string | null, outputPath: string, srtPath: string | null = null, title: string | null = null) {
     return new Promise<void>((resolve, reject) => {
         let command = ffmpeg();
 
@@ -367,9 +374,37 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
         if (coverPath) {
             filters.push('[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10[bg]');
             filters.push('[0:v]scale=900:-1[fg]');
-            filters.push('[bg][fg]overlay=(W-w)/2:(H-h)/2[base]');
+            filters.push('[bg][fg]overlay=(W-w)/2:(H-h)/2[base_pre]');
         } else {
-            filters.push('[0:v]null[base]');
+            filters.push('[0:v]null[base_pre]');
+        }
+
+        // Title Overlay (Top)
+        if (title) {
+            // Processing title for line breaks:
+            // 1. Break after "】"
+            // 2. Break every 15 characters if line is too long
+            let processedTitle = title.replace(/】/g, "】\n").trim();
+            const titleLines = processedTitle.split("\n");
+            const finalTitleLines = titleLines.flatMap(line => {
+                const chunks = [];
+                for (let i = 0; i < line.length; i += 15) {
+                    chunks.push(line.slice(i, i + 15));
+                }
+                return chunks;
+            });
+            const displayTitle = finalTitleLines.join("\n");
+
+            // FFmpeg drawtext requires escaped colons and single quotes
+            const escapedTitle = displayTitle
+                .replace(/:/g, '\\:')
+                .replace(/'/g, "'\\\\''");
+
+            // drawtext filter for title
+            // x=(w-text_w)/2:y=150 (Top Center)
+            filters.push(`[base_pre]drawtext=text='${escapedTitle}':fontfile='C\\\\:/Windows/Fonts/msgothic.ttc':fontsize=40:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=150:line_spacing=10[base]`);
+        } else {
+            filters.push('[base_pre]null[base]');
         }
 
         // Subtitles Filter (Styled)
@@ -383,10 +418,9 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
             // INCREASED: Fontsize=36, MarginV=100 for better visibility in 1080x1920
             // BorderStyle=1 is outline
             // Explicit color format &H<alpha><blue><green><red>
-            // Fontsize increased to 52.
-            // Note: Line spacing is difficult to control with force_style, 
-            // but increasing font size naturally improves presence.
-            const style = "PlayResX=1080,PlayResY=1920,Fontname=MS Gothic,Fontsize=52,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,BorderStyle=1,Alignment=2,MarginV=150,MarginL=150,MarginR=150";
+            // Fontsize increased to 60 for better impact.
+            // MarginV increased slightly to 180 to lift it up slightly from the very bottom.
+            const style = "PlayResX=1080,PlayResY=1920,Fontname=MS Gothic,Fontsize=60,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,BorderStyle=1,Alignment=2,MarginV=180,MarginL=150,MarginR=150";
 
             console.log(`Job: Applying subtitles with escaped path: ${escapedPath}`);
             filters.push(`[base]subtitles=filename='${escapedPath}':force_style='${style}'[final]`);
@@ -451,7 +485,7 @@ function generateSRT(segments: any[]): string {
     let blockIndex = 1;
     let srt = "";
 
-    const maxCharsPerLine = 14; // Slightly reduced for larger 52px font
+    const maxCharsPerLine = 12; // Reduced for even larger 60px font
 
     for (const seg of segments) {
         if (Array.isArray(seg) && seg.length >= 3) {
@@ -460,6 +494,11 @@ function generateSRT(segments: any[]): string {
             let text = seg[2].trim();
 
             if (text) {
+                // Convert common laughter markers to "ww" for spoken feel
+                text = text.replace(/[（(]笑[）)]/g, "ww")
+                    .replace(/笑い声/g, "ww")
+                    .replace(/笑う/g, "ww");
+
                 // Smart splitting for Japanese:
                 // 1. Try splitting at punctuation (。, 、)
                 // 2. If a segment is still too long, split every N characters
