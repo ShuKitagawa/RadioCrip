@@ -297,33 +297,31 @@ async function findBestClip(filePath: string, clipDuration: number): Promise<num
 
     console.log(`Analyzing audio duration: ${duration.toFixed(1)}s. Range: ${startRange.toFixed(1)}-${endRange.toFixed(1)}s (30 samples)`);
 
+    const allCandidates: { time: number, vol: number }[] = [];
+
     // We process candidates sequentially to avoid spawning too many ffmpeg processes
     for (let i = 0; i < candidates; i++) {
         const startTime = startRange + (i * step);
         try {
             const vol = await analyzeVolume(filePath, startTime, clipDuration);
-
-            // Collect candidates with the highest volume. 
-            // We use a small epsilon (0.1dB) to treat similar volumes as "ties"
-            if (vol > maxVolume + 0.1) {
-                maxVolume = vol;
-                bestCandidates = [{ time: startTime, vol }];
-            } else if (Math.abs(vol - maxVolume) <= 0.1) {
-                bestCandidates.push({ time: startTime, vol });
-            }
+            allCandidates.push({ time: startTime, vol });
         } catch (e: any) {
             console.warn(`Volume analysis failed at ${startTime.toFixed(1)}s: ${e.message}`);
         }
     }
 
-    if (bestCandidates.length === 0) return startRange;
+    if (allCandidates.length === 0) return startRange;
 
-    // Tie-handling: Pick the candidate closest to the center of the episode to avoid beginning bias
-    const midPoint = duration / 2;
-    bestCandidates.sort((a, b) => Math.abs(a.time - midPoint) - Math.abs(b.time - midPoint));
+    // Sort by volume descending (loudest first)
+    allCandidates.sort((a, b) => b.vol - a.vol);
 
-    const selected = bestCandidates[0];
-    console.log(`Found ${bestCandidates.length} high-volume areas. Selected ${selected.time.toFixed(1)}s (Volume: ${selected.vol}dB)`);
+    // Pick randomly from the top 10 (or fewer if not enough candidates)
+    // This ensures variety instead of always picking the same "loudest" spot.
+    const poolSize = Math.min(10, allCandidates.length);
+    const randomIndex = Math.floor(Math.random() * poolSize);
+    const selected = allCandidates[randomIndex];
+
+    console.log(`Pool size: ${poolSize}. Selected random index ${randomIndex}: ${selected.time.toFixed(1)}s (Volume: ${selected.vol}dB)`);
 
     return selected.time;
 }
