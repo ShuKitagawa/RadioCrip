@@ -162,22 +162,26 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
                 await convertToWav(clipPath, wavPath);
 
                 // 4b. Ensure model exists
-                const modelName = "ggml-medium.bin";
+                const modelName = "ggml-large-v3.bin";
                 const modelPath = path.join(process.cwd(), "models", modelName);
                 if (!fs.existsSync(modelPath)) {
-                    update("processing", 60, "Downloading Whisper Model (150MB)...");
+                    update("processing", 60, "Downloading Whisper Model Large-v3 (3GB)...");
                     await downloadWhisperModel(modelName, modelPath);
                 }
 
                 // 4c. Transcribe Locally
-                update("processing", 65, "Transcribing Locally...");
-                console.log(`Job ${jobId}: Starting local transcription with model: ${modelPath}`);
+                update("processing", 65, "Transcribing Locally (0%)...");
+                console.log(`Job ${jobId}: Starting local transcription with Large-v3 model`);
                 const result = await whisper.transcribe({
                     fname_inp: wavPath,
                     model: modelPath,
                     language: "ja",
                     use_gpu: true,
-                    translate: false // Ensure we get Japanese, not English translation
+                    translate: false,
+                    progress_callback: (progress: number) => {
+                        const percent = Math.round(progress);
+                        update("processing", 65 + (percent * 0.25), `Transcribing Locally (${percent}%)...`);
+                    }
                 });
 
                 console.log(`Job ${jobId}: Raw transcription result:`, JSON.stringify(result).substring(0, 1000));
