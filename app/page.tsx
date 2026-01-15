@@ -31,6 +31,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const [processingJobId, setProcessingJobId] = useState<string | null>(null);
   const [enableSubtitles, setEnableSubtitles] = useState(true);
+  const [exportMode, setExportMode] = useState<'video' | 'premiere'>('video');
 
 
   const pollInterval = useRef<NodeJS.Timeout | null>(null);
@@ -61,7 +62,7 @@ export default function Home() {
       const res = await fetch("/api/process", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rssUrl, episodeUrl, enableSubtitles }),
+        body: JSON.stringify({ rssUrl, episodeUrl, enableSubtitles, exportMode }),
       });
 
       if (!res.ok) {
@@ -147,6 +148,29 @@ export default function Home() {
                 className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${enableSubtitles ? 'translate-x-6' : 'translate-x-1'}`}
               />
             </button>
+          </div>
+          {/* Export Mode Toggle */}
+          <div className="flex items-center justify-between p-4 bg-slate-800/30 rounded-xl border border-slate-700/50">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-200">書き出しモード</h3>
+              <p className="text-xs text-slate-500">
+                {exportMode === 'video' ? 'SNS用（字幕焼き付け動画）' : 'Premiere用（XML+SRT+動画素材）'}
+              </p>
+            </div>
+            <div className="flex bg-slate-800 p-1 rounded-lg">
+              <button
+                onClick={() => setExportMode('video')}
+                className={`text-[10px] px-2 py-1 rounded transition-all ${exportMode === 'video' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                Video
+              </button>
+              <button
+                onClick={() => setExportMode('premiere')}
+                className={`text-[10px] px-2 py-1 rounded transition-all ${exportMode === 'premiere' ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                Premiere
+              </button>
+            </div>
           </div>
 
           {/* Status Display (Global) */}

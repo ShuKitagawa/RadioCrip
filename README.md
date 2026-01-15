@@ -5,14 +5,22 @@
 ## 機能
 
 - **エピソード選択**: RSSフィードからエピソード一覧を取得し、好きな回を選択可能。
-- **自動切り抜き**: 開始1:00から60秒間を自動でカット。
-- **動画生成**: カバーアートを背景に使用し、音声と合わせたMP4ファイルを出力。
-- **ダウンロード**: 生成された動画をブラウザから直接ダウンロード。
+- **高性能AI文字起こし**: OpenAI Whisper (Large-v3モデル)をローカルで使用し、高精度な日本語字幕を自動生成。
+- **スマート・ハイライト抽出**: エピソード内の盛り上がり箇所を自動分析。トップ10の候補からランダムに1箇所を選ぶことで、生成のたびに異なるシーンを抽出。
+- **動画カスタマイズ**:
+    - 縦型動画（1080x1920）に最適化。
+    - タイトルの自動配置（かわいい丸文字フォント）。
+    - 日本語特有の自然な字幕折り返し。
+    - 笑い声の自動検出と「ww」変換。
+    - エンディングの2秒間フェードアウト（映像・音声）。
+- **Adobe Premiere Pro 連携**: FCP XML形式でのプロジェクト書き出しに対応。動画素材、音声、字幕ファイルを解凍して読み込むだけで、Premiere上での微調整が可能。
+- **ローカル完結**: すべての処理がPC内で完結するため、API利用料もかからず、プライバシーも守られます。
 
 ## 必要要件
 
 - Node.js (v18推奨)
-- FFmpeg (※ `ffmpeg-static` パッケージにより自動でセットアップされますが、システムによってはインストールが必要な場合があります)
+- **GPU推奨**: Whisperの実行にNVIDIA GPU (CUDA) を使用します（GTX 1660 SUPER以上を推奨）。
+- FFmpeg: `ffmpeg-static` を使用。
 
 ## インストール手順
 
@@ -23,20 +31,28 @@ npm install
 ## 使い方
 
 1. 開発サーバーを起動します。
-
-```bash
-npm run dev
-```
-
+   ```bash
+   npm run dev
+   ```
 2. ブラウザで `http://localhost:3000` にアクセスします。
-3. エピソード一覧から「Generate」ボタンをクリックします。
-4. 処理が完了するとダウンロードボタンが表示されます。
+3. **書き出しモードを選択**:
+   - **Video**: SNS投稿用の字幕入りMP4を直接出力。
+   - **Premiere**: Premiereで編集するためのZIPセット（XML, SRT, 動画）を出力。
+4. エピソード一覧から「Generate」ボタンをクリックします。
+5. 処理が完了するとダウンロードボタンが表示されます。
+
+### Premiere Proへの読み込み方（Premiereモード時）
+1. ダウンロードしたZIPを解凍します。
+2. Premiere Proのプロジェクトパネルに `project.xml` をドラッグ＆ドロップします。
+3. 自動で作成されたシーケンスを開くと、動画と音声が配置されています。
+4. `.srt` ファイルを読み込み、タイムラインに配置してデザインを調整してください。
 
 ## 技術スタック
 
-- **Frontend**: Next.js, React, Tailwind CSS
+- **Frontend**: Next.js (App Router), React, Tailwind CSS, Lucide React
 - **Backend**: Next.js API Routes
-- **Media Processing**: fluent-ffmpeg, ffmpeg-static
+- **Machine Learning**: @kutalia/whisper-node-addon (Whisper Large-v3)
+- **Media Processing**: fluent-ffmpeg, adm-zip
 - **RSS**: rss-parser
 
 ## ライセンス

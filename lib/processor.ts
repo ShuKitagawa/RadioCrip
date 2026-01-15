@@ -10,6 +10,7 @@ import ffmpegPath from "ffmpeg-static";
 import { path as ffprobePath } from "ffprobe-static";
 // @ts-ignore
 import * as whisper from "@kutalia/whisper-node-addon";
+import AdmZip from "adm-zip";
 
 // OpenAI client and polyfills removed for local Whisper migration
 
@@ -56,7 +57,7 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
-export async function startJob(jobId: string, rssUrl: string, episodeUrl?: string, enableSubtitles: boolean = true) {
+export async function startJob(jobId: string, rssUrl: string, episodeUrl?: string, enableSubtitles: boolean = true, exportMode: 'video' | 'premiere' = 'video') {
     const jobDir = path.join(os.tmpdir(), `podclip-${jobId}`);
     if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
 
@@ -220,13 +221,50 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
         };
 
         const timeStr = `${formatSec(finalStartTime)}～${formatSec(finalStartTime + finalDuration)}`;
-        const fileName = `【切り抜き1分】${safeTitle}_${timeStr}.mp4`;
-        const outputPath = path.join(DOWNLOAD_DIR, fileName);
 
-        await renderVideo(clipPath, coverPath, outputPath, srtPath, targetEp.title);
+        let finalFileName = "";
+        let finalDownloadUrl = "";
+
+        if (exportMode === 'premiere') {
+            // mode 1: Premiere Export (Clean Video + SRT + XML ZIP)
+            const cleanVideoName = `【切り抜き1分】${safeTitle}_${timeStr}_CLEAN.mp4`;
+            const cleanVideoPath = path.join(jobDir, cleanVideoName);
+
+            // Render video without BURNED subtitles
+            update("processing", 75, "Rendering Clean Video for Premiere...");
+            await renderVideo(clipPath, coverPath, cleanVideoPath, null, targetEp.title);
+
+            // Generate FCP XML
+            const xmlName = "project.xml";
+            const xmlPath = path.join(jobDir, xmlName);
+            const xmlContent = generateFCPXML(cleanVideoName, finalDuration, targetEp.title || "Clip");
+            fs.writeFileSync(xmlPath, xmlContent, 'utf8');
+
+            // Package into ZIP
+            update("processing", 90, "Packaging for Premiere...");
+            const zip = new AdmZip();
+            zip.addLocalFile(cleanVideoPath);
+            if (srtPath && fs.existsSync(srtPath)) zip.addLocalFile(srtPath);
+            zip.addLocalFile(xmlPath);
+
+            const zipName = `【切り抜き1分】${safeTitle}_${timeStr}_Premiere.zip`;
+            const zipPath = path.join(DOWNLOAD_DIR, zipName);
+            zip.writeZip(zipPath);
+
+            finalFileName = zipName;
+            finalDownloadUrl = `/downloads/${encodeURIComponent(zipName)}`;
+        } else {
+            // mode 2: Normal Video (Burned subtitles)
+            const fileName = `【切り抜き1分】${safeTitle}_${timeStr}.mp4`;
+            const outputPath = path.join(DOWNLOAD_DIR, fileName);
+            await renderVideo(clipPath, coverPath, outputPath, srtPath, targetEp.title);
+
+            finalFileName = fileName;
+            finalDownloadUrl = `/downloads/${encodeURIComponent(fileName)}`;
+        }
 
         // Cleanup
-        // fs.rmSync(jobDir, { recursive: true, force: true }); // Keep for debug if needed, or delete
+        // fs.rmSync(jobDir, { recursive: true, force: true }); 
 
         // Complete
         const j = jobs.get(jobId);
@@ -234,7 +272,7 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
             j.status = "completed";
             j.progress = 100;
             j.message = "Done!";
-            j.downloadUrl = `/downloads/${encodeURIComponent(fileName)}`;
+            j.downloadUrl = finalDownloadUrl;
         }
 
     } catch (err: any) {
@@ -299,9 +337,11 @@ async function findBestClip(filePath: string, clipDuration: number): Promise<num
 
     const allCandidates: { time: number, vol: number }[] = [];
 
-    // We process candidates sequentially to avoid spawning too many ffmpeg processes
+    // We process candidates with a slight random offset to ensure variety
     for (let i = 0; i < candidates; i++) {
-        const startTime = startRange + (i * step);
+        // Add random jitter (-1s to +1s) to the sampling point
+        const jitter = (Math.random() - 0.5) * 2;
+        const startTime = Math.max(startRange, Math.min(endRange, startRange + (i * step) + jitter));
         try {
             const vol = await analyzeVolume(filePath, startTime, clipDuration);
             allCandidates.push({ time: startTime, vol });
@@ -366,6 +406,8 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
         }
 
         command.input(audioPath);
+        // Audio Fade-out: 2s fade at the end (st=58 for 60s clip)
+        command.audioFilters('afade=t=out:st=58:d=2');
 
         const filters = [];
 
@@ -400,32 +442,29 @@ async function renderVideo(audioPath: string, coverPath: string | null, outputPa
 
             // drawtext filter for title
             // x=(w-text_w)/2:y=150 (Top Center)
-            filters.push(`[base_pre]drawtext=text='${escapedTitle}':fontfile='C\\\\:/Windows/Fonts/msgothic.ttc':fontsize=40:fontcolor=white:borderw=3:bordercolor=black:x=(w-text_w)/2:y=150:line_spacing=10[base]`);
+            // text_align=center ensures individual lines are centered
+            // Font: hgrgm.ttc (HG Maru Gothic M-PRO) is a common "cute" rounded font on Windows.
+            // Using fontsize=80 for higher impact.
+            filters.push(`[base_pre]drawtext=text='${escapedTitle}':fontfile='C\\\\:/Windows/Fonts/hgrgm.ttc':fontsize=80:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=150:line_spacing=15:text_align=center[title]`);
         } else {
-            filters.push('[base_pre]null[base]');
+            filters.push('[base_pre]null[title]');
         }
 
         // Subtitles Filter (Styled)
+        let subInput = 'title';
         if (srtPath && fs.existsSync(srtPath)) {
-            // FFmpeg subtitles filter on Windows requires very specific escaping:
-            // 1. Double backslashes for path or forward slashes
-            // 2. Colon after drive letter needs escaping (C\:/...)
-            // 3. The path must be single-quoted
             const escapedPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-
-            // INCREASED: Fontsize=36, MarginV=100 for better visibility in 1080x1920
-            // BorderStyle=1 is outline
-            // Explicit color format &H<alpha><blue><green><red>
-            // Fontsize increased to 60 for better impact.
-            // MarginV increased slightly to 180 to lift it up slightly from the very bottom.
             const style = "PlayResX=1080,PlayResY=1920,Fontname=MS Gothic,Fontsize=60,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,BorderStyle=1,Alignment=2,MarginV=180,MarginL=150,MarginR=150";
 
             console.log(`Job: Applying subtitles with escaped path: ${escapedPath}`);
-            filters.push(`[base]subtitles=filename='${escapedPath}':force_style='${style}'[final]`);
+            filters.push(`[title]subtitles=filename='${escapedPath}':force_style='${style}'[subs]`);
+            subInput = 'subs';
         } else {
             console.warn("No subtitles file found or srtPath is null, skipping subtitles filter.");
-            filters.push('[base]null[final]');
         }
+
+        // Final Fade-out Filter (2s)
+        filters.push(`[${subInput}]fade=t=out:st=58:d=2[final]`);
 
         command
             .complexFilter(filters) // No second argument to avoid automatic mapping
@@ -593,4 +632,63 @@ async function findNearestSilence(
             })
             .run();
     });
+}
+function generateFCPXML(videoFile: string, duration: number, title: string) {
+    const totalFrames = Math.floor(duration * 30);
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xmeml>
+<xmeml version="5">
+<sequence>
+    <name>${title}</name>
+    <duration>${totalFrames}</duration>
+    <rate>
+        <ntsc>FALSE</ntsc>
+        <timebase>30</timebase>
+    </rate>
+    <media>
+        <video>
+            <format>
+                <samplecharacteristics>
+                    <width>1080</width>
+                    <height>1920</height>
+                </samplecharacteristics>
+            </format>
+            <track>
+                <clipitem>
+                    <name>${videoFile}</name>
+                    <duration>${totalFrames}</duration>
+                    <rate>
+                        <ntsc>FALSE</ntsc>
+                        <timebase>30</timebase>
+                    </rate>
+                    <start>0</start>
+                    <end>${totalFrames}</end>
+                    <file>
+                        <name>${videoFile}</name>
+                        <pathurl>${videoFile}</pathurl>
+                    </file>
+                </clipitem>
+            </track>
+        </video>
+        <audio>
+            <track>
+                <clipitem>
+                    <name>${videoFile}</name>
+                    <duration>${totalFrames}</duration>
+                    <rate>
+                        <ntsc>FALSE</ntsc>
+                        <timebase>30</timebase>
+                    </rate>
+                    <start>0</start>
+                    <end>${totalFrames}</end>
+                    <file>
+                        <name>${videoFile}</name>
+                        <pathurl>${videoFile}</pathurl>
+                    </file>
+                </clipitem>
+            </track>
+        </audio>
+    </media>
+</sequence>
+</xmeml>`;
 }
