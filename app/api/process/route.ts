@@ -6,7 +6,7 @@ import { startJob } from "@/lib/processor"; // We will implement this next
 export async function POST(req: Request) {
     try {
         const body = await req.json();
-        const { rssUrl, episodeUrl, enableSubtitles } = body;
+        const { rssUrl, episodeUrl, enableSubtitles, startTime } = body;
 
         if (!rssUrl) {
             return NextResponse.json({ error: "RSS URL is required" }, { status: 400 });
@@ -26,7 +26,7 @@ export async function POST(req: Request) {
 
         // Start processing asynchronously
         // Note: We do NOT await this, so the response returns immediately
-        startJob(jobId, rssUrl, episodeUrl, enableSubtitles).catch(err => {
+        startJob(jobId, rssUrl, episodeUrl, enableSubtitles, "video", startTime).catch(err => {
             console.error(`Unhandled error in job ${jobId}:`, err);
             const job = jobs.get(jobId);
             if (job) {

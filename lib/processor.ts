@@ -60,7 +60,7 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
     fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 }
 
-export async function startJob(jobId: string, rssUrl: string, episodeUrl?: string, enableSubtitles: boolean = true, exportMode: 'video' | 'premiere' = 'video') {
+export async function startJob(jobId: string, rssUrl: string, episodeUrl?: string, enableSubtitles: boolean = true, exportMode: 'video' | 'premiere' = 'video', manualStartTime?: number) {
     const jobDir = path.join(os.tmpdir(), `podclip-${jobId}`);
     if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
 
@@ -109,23 +109,31 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
             }
         }
 
-        // 3. Extract Clip (Smart Clipping w/ Silence Detection)
-        update("processing", 35, "Analyzing for Best Highlight...");
-
-        // Find best 60s clip base
+        // 3. Extract Clip (Smart Clipping w/ Silence Detection) OR Manual
+        let finalStartTime = 0;
         const baseClipDuration = 60;
-        let finalStartTime = await findBestClip(audioPath, baseClipDuration);
-        let finalEndTime = finalStartTime + baseClipDuration;
 
-        console.log(`Job ${jobId}: Initial best start time at ${finalStartTime}s`);
+        if (typeof manualStartTime === 'number') {
+            update("processing", 35, "Applying Manual Start Time...");
+            finalStartTime = manualStartTime;
+            console.log(`Job ${jobId}: Using manual start time: ${finalStartTime}s`);
+        } else {
+            update("processing", 35, "Analyzing for Best Highlight...");
 
-        // Refine Start: Look back 5s for silence
-        update("processing", 40, "Refining Start Point...");
-        const adjustedStart = await findNearestSilence(audioPath, finalStartTime, 5, "backward");
-        if (adjustedStart !== -1) {
-            console.log(`Job ${jobId}: Adjusted start from ${finalStartTime}s to ${adjustedStart}s`);
-            finalStartTime = adjustedStart;
+            // Find best 60s clip base
+            finalStartTime = await findBestClip(audioPath, baseClipDuration);
+            console.log(`Job ${jobId}: Initial best start time at ${finalStartTime}s`);
+
+            // Refine Start: Look back 5s for silence
+            update("processing", 40, "Refining Start Point...");
+            const adjustedStart = await findNearestSilence(audioPath, finalStartTime, 5, "backward");
+            if (adjustedStart !== -1) {
+                console.log(`Job ${jobId}: Adjusted start from ${finalStartTime}s to ${adjustedStart}s`);
+                finalStartTime = adjustedStart;
+            }
         }
+
+        let finalEndTime = finalStartTime + baseClipDuration;
 
         // Fixed Duration: Ensure exactly 60 seconds from the (potentially adjusted) start
         const fixedDuration = 60;
@@ -182,7 +190,7 @@ export async function startJob(jobId: string, rssUrl: string, episodeUrl?: strin
                     language: "ja",
                     use_gpu: true,
                     translate: false,
-                    max_len: 35, // Increased from 20 for longer, more readable segments
+                    max_len: 0, // Disable internal splitting to prevent multibyte character corruption
                     progress_callback: (progress: number) => {
                         const percent = Math.round(progress);
                         update("processing", 65 + (percent * 0.25), `Transcribing Locally (${percent}%)...`);
@@ -427,9 +435,71 @@ async function renderVideo(
         if (burned && srtPath && fs.existsSync(srtPath)) {
             const escapedPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
             const style = "PlayResX=1080,PlayResY=1920,Fontname=MS Gothic,Fontsize=60,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,BorderStyle=1,Alignment=2,MarginV=180,MarginL=150,MarginR=150";
-            filters.push(`[${videoInput}]subtitles=filename='${escapedPath}':force_style='${style}'[subs]`);
+            filters.push(`[${videoInput}]subtitles=filename='${escapedPath}':charenc=UTF-8:force_style='${style}'[subs]`);
             videoInput = 'subs';
         }
+
+        // Waveform Generation & Overlay (Spectrum Analyzer)
+        // Boost volume for visualization only (does not affect audio track) to make it larger
+        // showfreqs: mode=bar (bars), fscale=log (musical pitch), ascale=sqrt (better visibility)
+        // Waveform Generation & Overlay (Spectrum Analyzer)
+        // Boost volume for visualization only (does not affect audio track) to make it larger
+        // showfreqs: mode=bar (bars), fscale=log (musical pitch), ascale=sqrt (better visibility)
+        // Waveform Generation & Overlay (Spectrum Analyzer with Shadow)
+        // 1. Boost Volume
+        filters.push({
+            filter: 'volume',
+            options: '5.0',
+            inputs: '1:a',
+            outputs: 'loud_a'
+        });
+
+        // 2. Generate White Waveform (Spectrum)
+        filters.push({
+            filter: 'showfreqs',
+            options: {
+                s: '960x150', // Reduced height for header space
+                mode: 'bar',
+                ascale: 'sqrt',
+                fscale: 'log',
+                colors: 'white'
+            },
+            inputs: 'loud_a',
+            outputs: 'wave_raw'
+        });
+
+        // 3. Split into Front (White) and Shadow (Black)
+        filters.push({
+            filter: 'split',
+            inputs: 'wave_raw',
+            outputs: ['wave_white', 'wave_shadow_src']
+        });
+
+        // 4. Create Black Shadow
+        filters.push({
+            filter: 'lutrgb',
+            options: { r: 0, g: 0, b: 0 },
+            inputs: 'wave_shadow_src',
+            outputs: 'wave_black'
+        });
+
+        // 5. Overlay Shadow (Offset +3px) at y=320
+        filters.push({
+            filter: 'overlay',
+            options: { x: '60+3', y: '320+3' },
+            inputs: [videoInput, 'wave_black'],
+            outputs: 'video_with_shadow'
+        });
+
+        // 6. Overlay White (Original) at y=320
+        filters.push({
+            filter: 'overlay',
+            options: { x: 60, y: '320' },
+            inputs: ['video_with_shadow', 'wave_white'],
+            outputs: 'with_wave'
+        });
+
+        videoInput = 'with_wave';
 
         // Final Fade-out to black (53s to 55s - 2 second fade)
         filters.push(`[${videoInput}]fade=t=out:st=53:d=2[blacked]`);

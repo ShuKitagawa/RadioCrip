@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef } from "react";
-import { Podcast, Download, AlertCircle, Loader2, Play, Search, Video, Settings2 } from "lucide-react";
+import { Podcast, Download, AlertCircle, Loader2, Play, Search, Video, Settings2, Clock, Timer, X, Music } from "lucide-react";
 
 type ProcessingStatus = "idle" | "processing" | "completed" | "failed";
 
@@ -40,6 +40,11 @@ export default function Home() {
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [enableSubtitles, setEnableSubtitles] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
+  const [isManualMode, setIsManualMode] = useState(false);
+  const [selectedEpisode, setSelectedEpisode] = useState<Episode | null>(null);
+  const [manualMin, setManualMin] = useState(0);
+  const [manualSec, setManualSec] = useState(0);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
 
   const pollInterval = useRef<NodeJS.Timeout | null>(null);
@@ -59,7 +64,7 @@ export default function Home() {
       });
   }
 
-  const startProcessing = async (episodeUrl: string) => {
+  const startProcessing = async (episodeUrl: string, startTime?: number) => {
     setStatus("processing");
     setProgress(0);
     setMessage("初期化中...");
@@ -71,7 +76,7 @@ export default function Home() {
       const res = await fetch("/api/process", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rssUrl, episodeUrl, enableSubtitles }),
+        body: JSON.stringify({ rssUrl, episodeUrl, enableSubtitles, startTime }),
       });
 
       if (!res.ok) {
@@ -216,7 +221,21 @@ export default function Home() {
             </div>
           </div>
           <div className="flex gap-4">
-            {/* Export mode toggle removed: system now prepares both MP4 and ZIP in one pass */}
+            {/* Mode Toggle */}
+            <div className="bg-zinc-800 p-1 rounded-2xl flex items-center border border-zinc-700/50">
+              <button
+                onClick={() => setIsManualMode(false)}
+                className={`px-6 py-3 rounded-xl text-xs font-bold uppercase tracking-wider transition-all ${!isManualMode ? 'bg-zinc-100 text-zinc-900 shadow-lg' : 'text-zinc-500 hover:text-zinc-300'}`}
+              >
+                Auto
+              </button>
+              <button
+                onClick={() => setIsManualMode(true)}
+                className={`px-6 py-3 rounded-xl text-xs font-bold uppercase tracking-wider transition-all ${isManualMode ? 'bg-zinc-100 text-zinc-900 shadow-lg' : 'text-zinc-500 hover:text-zinc-300'}`}
+              >
+                Manual
+              </button>
+            </div>
           </div>
         </div>
 
@@ -285,7 +304,15 @@ export default function Home() {
                       </div>
                     </div>
                     <button
-                      onClick={() => startProcessing(ep.audioUrl)}
+                      onClick={() => {
+                        if (isManualMode) {
+                          setSelectedEpisode(ep);
+                          setManualMin(0);
+                          setManualSec(0);
+                        } else {
+                          startProcessing(ep.audioUrl);
+                        }
+                      }}
                       disabled={status === "processing" || (processingJobId !== null && processingJobId !== ep.audioUrl)}
                       className={`shrink-0 flex items-center gap-4 px-8 py-4 rounded-2xl text-[10px] font-bold uppercase tracking-[0.2em] transition-all shadow-2xl h-fit border ${status === "processing" && processingJobId === ep.audioUrl
                         ? 'bg-zinc-100 text-zinc-900 border-white'
@@ -300,7 +327,7 @@ export default function Home() {
                       ) : (
                         <>
                           <Play className="w-4 h-4 fill-current" />
-                          切り抜き生成
+                          {isManualMode ? "範囲指定" : "切り抜き生成"}
                         </>
                       )}
                     </button>
@@ -498,6 +525,96 @@ export default function Home() {
           animation: bounce 0.5s ease-infinite;
         }
       `}</style>
+
+      {/* Manual Selection Modal */}
+      {selectedEpisode && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-[2.5rem] w-full max-w-2xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-300">
+            <div className="p-8 space-y-8">
+              <div className="flex items-start justify-between">
+                <div>
+                  <h3 className="text-xl font-bold text-white tracking-tight mb-2">クリップ範囲を指定</h3>
+                  <p className="text-zinc-400 text-sm">{selectedEpisode.title}</p>
+                </div>
+                <button
+                  onClick={() => setSelectedEpisode(null)}
+                  className="p-2 bg-zinc-800 rounded-full text-zinc-400 hover:text-white hover:bg-zinc-700 transition-colors"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              {/* Audio Preview */}
+              <div className="bg-zinc-950 p-6 rounded-3xl border border-zinc-800">
+                <audio
+                  ref={audioRef}
+                  src={selectedEpisode.audioUrl}
+                  controls
+                  className="w-full mb-4"
+                />
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label className="text-[10px] uppercase font-bold text-zinc-500 tracking-widest">開始時間 (分)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={manualMin}
+                      onChange={(e) => setManualMin(parseInt(e.target.value) || 0)}
+                      className="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-2xl font-bold text-white focus:outline-none focus:border-zinc-600 transition-colors text-center"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[10px] uppercase font-bold text-zinc-500 tracking-widest">開始時間 (秒)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="59"
+                      value={manualSec}
+                      onChange={(e) => setManualSec(parseInt(e.target.value) || 0)}
+                      className="w-full bg-zinc-900 border border-zinc-800 rounded-xl p-4 text-2xl font-bold text-white focus:outline-none focus:border-zinc-600 transition-colors text-center"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-zinc-800/50 p-6 rounded-3xl border border-dashed border-zinc-700/50 flex items-center gap-4">
+                <div className="w-12 h-12 bg-zinc-800 rounded-2xl flex items-center justify-center border border-zinc-700">
+                  <Clock className="w-6 h-6 text-zinc-400" />
+                </div>
+                <div>
+                  <p className="text-sm font-bold text-zinc-300">プレビュー機能</p>
+                  <p className="text-xs text-zinc-500 mt-1">設定した開始時間から音声を再生して確認できます</p>
+                </div>
+                <button
+                  onClick={() => {
+                    if (audioRef.current) {
+                      const time = (manualMin * 60) + manualSec;
+                      audioRef.current.currentTime = time;
+                      audioRef.current.play();
+                    }
+                  }}
+                  className="ml-auto px-6 py-3 bg-zinc-100 hover:bg-white text-zinc-900 rounded-xl font-bold text-xs uppercase tracking-widest transition-colors flex items-center gap-2"
+                >
+                  <Play className="w-4 h-4 fill-current" />
+                  再生
+                </button>
+              </div>
+
+              <button
+                onClick={() => {
+                  const startTime = (manualMin * 60) + manualSec;
+                  startProcessing(selectedEpisode.audioUrl, startTime);
+                  setSelectedEpisode(null);
+                }}
+                className="w-full py-6 bg-white hover:bg-zinc-200 text-zinc-950 rounded-3xl font-black text-lg uppercase tracking-widest transition-all shadow-xl hover:scale-[1.02] active:scale-[0.98] flex items-center justify-center gap-4"
+              >
+                <Video className="w-6 h-6" />
+                この範囲でクリップを作成 (1分)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
